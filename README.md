@@ -1,0 +1,2 @@
+# GA-Rastrigin
+遺伝的アルゴリズムによりRastrigin関数の最小値を探索するプログラム
