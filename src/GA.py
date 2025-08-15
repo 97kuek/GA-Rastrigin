@@ -1,351 +1,283 @@
-# 遺伝的アルゴリズムでRastrigin関数の最小値を求めるプログラム
+# ==========================================================
+# 遺伝的アルゴリズム(GA)によるRastrigin関数の最小値探索
+# ==========================================================
 
-# ========= インポート =========
-from __future__ import annotations
 import math
 import random
-from dataclasses import dataclass, field
-from typing import Callable, List, Tuple, Dict, Optional
+from dataclasses import dataclass
+from typing import List, Callable, Optional, Dict, Any
+from pathlib import Path
 
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.animation import PillowWriter, FuncAnimation
 
-# ========= 評価関数 =========
+# ------------------ 評価関数（目的関数） ------------------
 def rastrigin(x: List[float]) -> float:
     A = 10.0
     n = len(x)
-    return A * n + sum((xi * xi - A * math.cos(2 * math.pi * xi)) for xi in x)
+    return A * n + sum((xi**2 - A * math.cos(2 * math.pi * xi)) for xi in x)
 
-# ========= 設定 =========
+# ------------------ GA（遺伝的アルゴリズム）の設定 ------------------
 @dataclass
 class GAConfig:
-    dim: int = 15                       # 次元数
-    lower_bound: float = -5.12          # Rastrigin関数の定義域
-    upper_bound: float = 5.12           # Rastrigin関数の定義域
-    pop_size: int = 500                 # 集団サイズ
-    max_generations: int = 1500          # 最大世代数
-    elite_ratio: float = 0.02           # エリート選択の割合
-    tournament_k: int = 3               # トーナメント選択の候補数
-    crossover_rate: float = 0.9         # 交叉率
-    mutation_rate: float = 1.0/dim       # 突然変異率
-    sbx_eta: float = 20.0               # SBX交叉の指数
-    pm_eta: float = 20.0                # 多項式突然変異の指数
-    stagnation_patience: int = 240       # 収束判定のための世代数
-    random_seed: Optional[int] = 42     # 乱数シード（Noneならランダム）
+    # 探索空間など
+    dim: int = 2                      # 変数の次元（ここでは2次元）
+    lower_bound: float = -5.12        # 探索範囲の下限
+    upper_bound: float =  5.12        # 探索範囲の上限
 
-    # 可視化
-    keep_history: bool = True           # 履歴を保持するか
-    log_interval: int = 20              # ログ出力の間隔（世代数）
-    # リアルタイム
-    realtime: bool = True               # リアルタイム可視化を行うか
-    refresh_every: int = 5              # 何世代ごとに再描画するか
-    show_2d_scatter: bool = True        # dim==2時に散布図を表示する
+    # 初期集団
+    init_low: float = -5.12
+    init_high: float = -2.0
 
-# ========= 履歴 =========
-@dataclass
-class GAHistory:
-    gens: List[int] = field(default_factory=list)
-    best: List[float] = field(default_factory=list)
-    mean: List[float] = field(default_factory=list)
-    median: List[float] = field(default_factory=list)
-    worst: List[float] = field(default_factory=list)
-    std: List[float] = field(default_factory=list)
-    best_x: List[List[float]] = field(default_factory=list)
+    # GAの規模
+    pop_size: int = 30                # 集団サイズ
+    max_generations: int = 100        # 最大世代数
+    offspring_per_gen: int = 60       # 1世代で生成する子の数（交叉→突然変異）
 
-# ========= ユーティリティ =========
+    # 交叉パラメータ
+    blx_alpha: float = 0.5            # BLX-α の α（親の区間 ±αI まで一様サンプル）
 
-# クリップ関数
-# xがloとhiの間に収まるようにする
+    # ★突然変異パラメータ（今回追加）★
+    #   - mutation_prob：各遺伝子（次元）に対し、この確率でノイズを加える
+    #   - mutation_sigma：ノイズの標準偏差（探索範囲幅に対する相対スケールで設定）
+    mutation_prob: float = 0.2
+    mutation_sigma_ratio: float = 0.08  # 範囲幅 * 0.08 を標準偏差に
+
+    # その他
+    random_seed: Optional[int] = 42   # 再現性のため固定（Noneにすると毎回ランダム）
+    log_interval: int = 10            # ログ表示間隔（世代単位）
+
+# ------------------ ユーティリティ関数群 ------------------
 def clamp(x: float, lo: float, hi: float) -> float:
+    """探索範囲を超えた場合に、範囲の端に制限（致死個体を防ぐ有効解修復）"""
     return max(lo, min(hi, x))
 
-# 個体の初期化
-# random.uniform(a, b)でaからbの間の乱数を生成
-# [... for _ in range(cfg.dim)]でcfg.dim次元のリストを生成(リスト内包表記)
 def init_individual(cfg: GAConfig) -> List[float]:
-    return [random.uniform(cfg.lower_bound, cfg.upper_bound) for _ in range(cfg.dim)]
+    """初期個体をランダム生成（init_low〜init_high の一様分布）"""
+    return [random.uniform(cfg.init_low, cfg.init_high) for _ in range(cfg.dim)]
 
-# 集団の初期化
-# init_individual(cfg)をpop_size回呼び出して初期集団を生成
 def init_population(cfg: GAConfig) -> List[List[float]]:
+    """初期集団（pop_size 個の個体）を生成"""
     return [init_individual(cfg) for _ in range(cfg.pop_size)]
 
-# 集団の評価
-# 処理の流れ
-# for ind in pop → 各個体indに対してobjective関数を適用
-# objective(ind)で適応度を計算し、リストに格納
 def evaluate_population(pop: List[List[float]], objective: Callable[[List[float]], float]) -> List[float]:
+    """全個体の目的関数値（小さいほど良い）を計算"""
     return [objective(ind) for ind in pop]
 
-def tournament_select(pop: List[List[float]], fitness: List[float], k: int) -> List[float]:
-    cand_idx = random.sample(range(len(pop)), k)
-    best_i = min(cand_idx, key=lambda i: fitness[i])
-    return pop[best_i][:]
+def roulette_select(pop: List[List[float]], fitness: List[float]) -> List[float]:
+    """
+    ルーレット選択（最小化版）
+    - 値が小さい個体ほど選ばれやすいように重みを付ける
+    - 重み s_i = f_max - f_i として、非負＆小さい f_i ほど大きい s_i になる
+    """
+    fmax = max(fitness)
+    scores = [fmax - f for f in fitness]
+    ssum = sum(scores)
+    if ssum <= 0:
+        # もし全員同じスコアなら一様ランダム
+        return pop[random.randrange(len(pop))][:]
+    r = random.random() * ssum
+    acc = 0.0
+    for ind, s in zip(pop, scores):
+        acc += s
+        if acc >= r:
+            return ind[:]
+    return pop[-1][:]  # 念のためのフォールバック
 
-def sbx_crossover(p1: List[float], p2: List[float], cfg: GAConfig) -> Tuple[List[float], List[float]]:
-    c1, c2 = p1[:], p2[:]
-    if random.random() > cfg.crossover_rate:
-        return c1, c2
-    for i in range(cfg.dim):
-        if random.random() < 0.5:
-            x1, x2 = p1[i], p2[i]
-            if x1 == x2:
-                c1[i] = x1; c2[i] = x2; continue
-            if x1 > x2: x1, x2 = x2, x1
-            lb, ub = cfg.lower_bound, cfg.upper_bound
-            r = random.random()
-            beta = 1.0 + (2.0 * (x1 - lb) / (x2 - x1))
-            alpha = 2.0 - beta ** (-(cfg.sbx_eta + 1.0))
-            if r <= 1.0/alpha:
-                betaq = (r * alpha) ** (1.0/(cfg.sbx_eta + 1.0))
-            else:
-                betaq = (1.0/(2.0 - r*alpha)) ** (1.0/(cfg.sbx_eta + 1.0))
-            child1 = 0.5*((x1+x2) - betaq*(x2-x1))
-            child2 = 0.5*((x1+x2) + betaq*(x2-x1))
-            c1[i] = clamp(child1, lb, ub)
-            c2[i] = clamp(child2, lb, ub)
-        else:
-            c1[i] = p1[i]; c2[i] = p2[i]
-    return c1, c2
-
-# 多項式突然変異
-# 個体indの各遺伝子ind[i]に対して、確率mutation_rateで突然変異を適用
-# 変異幅は多項式分布に従う
-# 変異後の値は、定義域の下限lower_boundと上限upper_boundにクリップされる
-def polynomial_mutation(ind: List[float], cfg: GAConfig) -> List[float]:
+def blx_alpha_crossover(p1: List[float], p2: List[float], cfg: GAConfig) -> List[float]:
+    """
+    BLX-α 交叉
+    - 親2個体の i番目の遺伝子 x1, x2 から、
+      [min-αI, max+αI]（I=|x2-x1|）の一様分布で子 c_i をサンプル
+    - 端に出たら clamp で修復
+    """
+    alpha = cfg.blx_alpha
     lb, ub = cfg.lower_bound, cfg.upper_bound
+    child: List[float] = []
     for i in range(cfg.dim):
-        if random.random() < cfg.mutation_rate:
-            x = ind[i]
-            if ub - lb <= 0: continue
-            delta1 = (x - lb)/(ub - lb)
-            delta2 = (ub - x)/(ub - lb)
-            r = random.random()
-            mut_pow = 1.0/(cfg.pm_eta + 1.0)
-            if r < 0.5:
-                xy = 1.0 - delta1
-                val = 2.0*r + (1.0 - 2.0*r)*(xy ** (cfg.pm_eta + 1.0))
-                deltaq = val ** mut_pow - 1.0
-            else:
-                xy = 1.0 - delta2
-                val = 2.0*(1.0 - r) + 2.0*(r - 0.5)*(xy ** (cfg.pm_eta + 1.0))
-                deltaq = 1.0 - val ** mut_pow
-            x = x + deltaq*(ub - lb)
-            ind[i] = clamp(x, lb, ub)
-    return ind
+        x1, x2 = p1[i], p2[i]
+        cmin, cmax = (x1, x2) if x1 <= x2 else (x2, x1)
+        I = cmax - cmin
+        low  = cmin - alpha * I
+        high = cmax + alpha * I
+        val = random.uniform(low, high)
+        child.append(clamp(val, lb, ub))
+    return child
 
-def _stats(fitness: List[float]) -> Tuple[float,float,float,float,float]:
-    arr = np.asarray(fitness, dtype=float)
-    return float(np.min(arr)), float(np.mean(arr)), float(np.median(arr)), float(np.max(arr)), float(np.std(arr))
+def gaussian_mutation(ind: List[float], cfg: GAConfig) -> List[float]:
+    """
+    ★ガウス変異（今回追加）
+    - 各遺伝子について確率 mutation_prob で N(0, sigma^2) のノイズを加える
+    - sigma は探索範囲幅に対する比（mutation_sigma_ratio）から算出
+    - 範囲外に出たら clamp で修復
+    """
+    lb, ub = cfg.lower_bound, cfg.upper_bound
+    width = ub - lb
+    sigma = cfg.mutation_sigma_ratio * width  # 例：幅×0.08
+    new_ind = ind[:]  # 破壊的変更を避けるならコピーして返す
+    for i in range(cfg.dim):
+        if random.random() < cfg.mutation_prob:
+            # 平均0, 標準偏差sigmaの正規分布からノイズを足す
+            mutated = new_ind[i] + random.gauss(0.0, sigma)
+            new_ind[i] = clamp(mutated, lb, ub)
+    return new_ind
 
-# ========= リアルタイム可視化クラス =========
-class RealtimeViz:
-    def __init__(self, cfg: GAConfig, objective: Callable[[List[float]], float]):
-        self.cfg = cfg
-        self.objective = objective
-        self.fig = None
-        self.ax_curve = None
-        self.ax_scatter = None
-        self.lines = {}   # "best","mean","median","worst","std" -> Line2D
-        self.scatter = None
-        self.contour_data = None  # (X, Y, Z)
-        self.gens = []
-        self.best = []
-        self.mean = []
-        self.median = []
-        self.worst = []
-        self.std = []
-
-    def start(self, init_pop: List[List[float]], init_fit: List[float]):
-        plt.ion()
-        self.fig = plt.figure(figsize=(10,4.5))
-        gs = self.fig.add_gridspec(1, 2) if (self.cfg.dim==2 and self.cfg.show_2d_scatter) else self.fig.add_gridspec(1,1)
-
-        # 収束曲線
-        self.ax_curve = self.fig.add_subplot(gs[0,0])
-        (l_best,)   = self.ax_curve.plot([], [], label="best")
-        (l_mean,)   = self.ax_curve.plot([], [], label="mean")
-        (l_median,) = self.ax_curve.plot([], [], label="median")
-        (l_worst,)  = self.ax_curve.plot([], [], label="worst")
-        (l_std,)    = self.ax_curve.plot([], [], linestyle="--", label="std (diversity)")
-        self.lines = {"best": l_best, "mean": l_mean, "median": l_median, "worst": l_worst, "std": l_std}
-        self.ax_curve.set_xlabel("Generation"); self.ax_curve.set_ylabel("Fitness"); self.ax_curve.set_title("Convergence (Live)")
-        self.ax_curve.grid(True, alpha=0.3); self.ax_curve.legend(loc="best")
-
-        # 2D 散布 + 等高線
-        if self.cfg.dim == 2 and self.cfg.show_2d_scatter:
-            self.ax_scatter = self.fig.add_subplot(gs[0,1])
-            lb, ub = self.cfg.lower_bound, self.cfg.upper_bound
-            xs = np.linspace(lb, ub, 300)
-            ys = np.linspace(lb, ub, 300)
-            X, Y = np.meshgrid(xs, ys)
-            Z = 20 + (X*X - 10*np.cos(2*np.pi*X)) + (Y*Y - 10*np.cos(2*np.pi*Y))
-            self.contour_data = (X, Y, Z)
-            self.ax_scatter.contour(X, Y, Z, levels=30, linewidths=0.5)
-            p = np.array([(ind[0], ind[1]) for ind in init_pop])
-            self.scatter = self.ax_scatter.scatter(p[:,0], p[:,1], s=10, alpha=0.6)
-            self.ax_scatter.set_xlim(lb, ub); self.ax_scatter.set_ylim(lb, ub)
-            self.ax_scatter.set_xlabel("x0"); self.ax_scatter.set_ylabel("x1")
-            self.ax_scatter.set_title("Population on 2D Landscape (Live)")
-            self.ax_scatter.grid(True, alpha=0.3)
-
-        # 初期点をプロット
-        b, m, med, w, s = _stats(init_fit)
-        self._append_stats(0, b, m, med, w, s)
-        self._redraw()
-
-    def update(self, gen: int, pop: List[List[float]], fitness: List[float]):
-        b, m, med, w, s = _stats(fitness)
-        self._append_stats(gen, b, m, med, w, s)
-        # 散布更新
-        if self.ax_scatter is not None:
-            p = np.array([(ind[0], ind[1]) for ind in pop])
-            self.scatter.set_offsets(p)  # 現世代の位置に更新
-        # 定期的に再描画
-        if gen % self.cfg.refresh_every == 0 or gen == 1:
-            self._redraw()
-
-    def finish(self):
-        self._redraw()
-        plt.ioff()
-        plt.show()
-
-    def _append_stats(self, gen, b, m, med, w, s):
-        self.gens.append(gen)
-        self.best.append(b); self.mean.append(m); self.median.append(med); self.worst.append(w); self.std.append(s)
-
-    def _redraw(self):
-        # 収束曲線のデータ更新
-        x = np.array(self.gens)
-        self.lines["best"].set_data(x, self.best)
-        self.lines["mean"].set_data(x, self.mean)
-        self.lines["median"].set_data(x, self.median)
-        self.lines["worst"].set_data(x, self.worst)
-        self.lines["std"].set_data(x, self.std)
-        # 軸範囲を自動調整（多少の余白）
-        if len(x) > 1:
-            self.ax_curve.set_xlim(0, max(x))
-            yall = np.concatenate([np.array(self.best), np.array(self.mean), np.array(self.median), np.array(self.worst)])
-            ymin, ymax = float(np.min(yall)), float(np.max(yall))
-            if ymin == ymax: ymax = ymin + 1.0
-            pad = 0.05*(ymax - ymin)
-            self.ax_curve.set_ylim(ymin - pad, ymax + pad)
-        self.fig.canvas.draw()
-        self.fig.canvas.flush_events()
-
-# ========= 進化ループ（可視化対応） =========
-def run_ga(objective: Callable[[List[float]], float],
-           cfg: GAConfig) -> Tuple[List[float], float, int, Optional[GAHistory]]:
+# ------------------ GA本体（MGGモデル） ------------------
+def run_ga_mgg_with_snapshots(objective: Callable[[List[float]], float], cfg: GAConfig):
+    """
+    MGG（Minimal Generation Gap）で世代を少しずつ更新する GA
+    1. 親選択：エリート1 + ルーレット1
+    2. 子生成：BLX-α で offspring_per_gen 体 → ガウス変異で微調整
+    3. 生存選択：親2 + 子 の中から最良2体を選ぶ
+    4. 置換：集団内の2枠だけを置き換える（= ギャップ最小）
+    """
+    # 再現性のため乱数シード固定（必要なければ None に）
     if cfg.random_seed is not None:
         random.seed(cfg.random_seed)
 
-    history = GAHistory() if cfg.keep_history else None
-    viz = RealtimeViz(cfg, objective) if cfg.realtime else None
-
+    # 初期集団と評価
     pop = init_population(cfg)
     fitness = evaluate_population(pop, objective)
 
-    # リアルタイム初期化
-    if viz is not None:
-        viz.start(pop, fitness)
-
-    elite_n = max(1, int(math.ceil(cfg.pop_size * cfg.elite_ratio)))
+    # ベストの初期化
     best_idx = min(range(len(pop)), key=lambda i: fitness[i])
     best_ind = pop[best_idx][:]
     best_fit = fitness[best_idx]
     best_gen = 0
-    no_improve = 0
 
-    # 履歴0世代
-    if history:
-        b, m, med, w, s = _stats(fitness)
-        history.gens.append(0)
-        history.best.append(b); history.mean.append(m); history.median.append(med)
-        history.worst.append(w); history.std.append(s)
-        history.best_x.append(best_ind[:])
+    # 可視化用スナップショット
+    snaps: List[Dict[str, Any]] = []
 
+    # === 世代ループ ===
     for gen in range(1, cfg.max_generations + 1):
-        # エリート
-        elites_idx = sorted(range(len(pop)), key=lambda i: fitness[i])[:elite_n]
-        elites = [pop[i][:] for i in elites_idx]
+        # ---- 親選択 ----
+        elite_i = min(range(len(pop)), key=lambda i: fitness[i])  # 集団内ベスト
+        elite = pop[elite_i][:]
+        roulette = roulette_select(pop, fitness)                  # ルーレットでもう1親
 
-        # 新集団
-        new_pop: List[List[float]] = []
-        new_pop.extend(elites)
-        while len(new_pop) < cfg.pop_size:
-            p1 = tournament_select(pop, fitness, cfg.tournament_k)
-            p2 = tournament_select(pop, fitness, cfg.tournament_k)
-            c1, c2 = sbx_crossover(p1, p2, cfg)
-            c1 = polynomial_mutation(c1, cfg); 
-            if len(new_pop) < cfg.pop_size: new_pop.append(c1)
-            c2 = polynomial_mutation(c2, cfg);
-            if len(new_pop) < cfg.pop_size: new_pop.append(c2)
+        # ---- 子個体生成（交叉 → 突然変異）----
+        offspring: List[List[float]] = []
+        for _ in range(cfg.offspring_per_gen):
+            child = blx_alpha_crossover(elite, roulette, cfg)  # BLX-αで親の区間±αIからサンプル
+            child = gaussian_mutation(child, cfg)              # ★微小なランダム揺らぎで探索の幅を確保
+            offspring.append(child)
 
-        pop = new_pop
+        # ---- 生存選択（親2 + 子 → 最良2体）----
+        candidates = offspring + [elite, roulette]
+        cand_fit = [objective(ind) for ind in candidates]
+        order = sorted(range(len(candidates)), key=lambda i: cand_fit[i])[:2]
+        surv1 = candidates[order[0]][:]  # 最良
+        surv2 = candidates[order[1]][:]  # 次点
+
+        # ---- 集団の一部を置き換える（MGGのミニマル更新）----
+        pop[elite_i] = surv1
+        roulette_j = (elite_i + 1) % cfg.pop_size  # シンプルに隣のスロットへ
+        pop[roulette_j] = surv2
+
+        # ---- 評価更新 ----
         fitness = evaluate_population(pop, objective)
 
-        # ベスト更新判定
-        curr_best_idx = min(range(len(pop)), key=lambda i: fitness[i])
-        curr_best_fit = fitness[curr_best_idx]
-        if curr_best_fit + 1e-12 < best_fit:
-            best_fit = curr_best_fit
-            best_ind = pop[curr_best_idx][:]
+        # ---- グローバルベスト更新 ----
+        curr_best_i = min(range(len(pop)), key=lambda i: fitness[i])
+        if fitness[curr_best_i] < best_fit:
+            best_fit = fitness[curr_best_i]
+            best_ind = pop[curr_best_i][:]
             best_gen = gen
-            no_improve = 0
-        else:
-            no_improve += 1
 
-        # 履歴
-        if history:
-            b, m, med, w, s = _stats(fitness)
-            history.gens.append(gen)
-            history.best.append(b); history.mean.append(m); history.median.append(med)
-            history.worst.append(w); history.std.append(s)
-            history.best_x.append(best_ind[:])
+        # ---- 可視化用スナップショット保存（座標のみ）----
+        snaps.append({
+            "gen": gen,
+            "pop": np.array(pop, dtype=float),
+            "best": np.array(best_ind, dtype=float),
+            "parents": np.array([elite, roulette], dtype=float),
+            "offspring": np.array(offspring, dtype=float),  # 交叉→突然変異後の子
+        })
 
-        # リアルタイム更新
-        if viz is not None:
-            viz.update(gen, pop, fitness)
-
-        # ログ
+        # ---- ログ ----
         if gen % cfg.log_interval == 0 or gen == 1:
-            print(f"[Gen {gen:3d}] best={best_fit:.6f}  mean={np.mean(fitness):.6f}  std={np.std(fitness):.6f}  last_improved@{best_gen}")
+            print(f"[Gen {gen:3d}] best={best_fit:.6f}  found@{best_gen}")
 
-        # 早期終了
-        if no_improve >= cfg.stagnation_patience:
-            print(f"Stop early: no improvement for {cfg.stagnation_patience} generations.")
-            break
+    return best_ind, best_fit, best_gen, snaps
 
-    if viz is not None:
-        viz.finish()
+# ------------------ アニメーション生成 ------------------
+def make_animation(snaps: List[Dict[str, Any]], cfg: GAConfig, path: Path):
+    """
+    世代ごとに保存したスナップショットを用いて、個体分布の推移をGIF化。
+    - 青：集団
+    - 赤：最良個体
+    - オレンジ/紫：親
+    - 灰：子（交叉→突然変異後）
+    """
+    lb, ub = cfg.lower_bound, cfg.upper_bound
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.set_xlim(lb, ub)
+    ax.set_ylim(lb, ub)
+    ax.set_xlabel("x0")
+    ax.set_ylabel("x1")
+    ax.set_title("Population Evolution (BLX-α + Gaussian Mutation, MGG)")
 
-    return best_ind, best_fit, best_gen, history
+    # 各描画レイヤ
+    scat_pop = ax.scatter([], [], s=25, color="blue", label="Population")
+    scat_best = ax.scatter([], [], s=90, marker="*", color="red", label="Best Individual")
+    scat_p1 = ax.scatter([], [], s=60, marker="s", color="orange", label="Parent 1 (Elite)")
+    scat_p2 = ax.scatter([], [], s=60, marker="D", color="purple", label="Parent 2 (Roulette)")
+    scat_off = ax.scatter([], [], s=8, alpha=0.35, color="gray", label="Offspring")
+    txt = ax.text(0.02, 0.98, "", transform=ax.transAxes, va="top")
 
-# ========= 実行 =========
+    ax.legend(loc="upper right")
+
+    # 初期フレーム（空）
+    def init():
+        empty = np.empty((0, 2))
+        scat_pop.set_offsets(empty)
+        scat_best.set_offsets(empty)
+        scat_p1.set_offsets(empty)
+        scat_p2.set_offsets(empty)
+        scat_off.set_offsets(empty)
+        txt.set_text("")
+        return scat_pop, scat_best, scat_p1, scat_p2, scat_off, txt
+
+    # 各フレームの更新
+    def update(frame_idx: int):
+        snap = snaps[frame_idx]
+        scat_pop.set_offsets(snap["pop"])
+        scat_best.set_offsets(snap["best"].reshape(1, 2))
+        scat_p1.set_offsets(snap["parents"][0].reshape(1, 2))
+        scat_p2.set_offsets(snap["parents"][1].reshape(1, 2))
+        scat_off.set_offsets(snap["offspring"])  # 交叉→突然変異後の子
+        txt.set_text(f"Gen {snap['gen']}")
+        return scat_pop, scat_best, scat_p1, scat_p2, scat_off, txt
+
+    # 少しゆっくり目の速度（必要に応じて interval / fps を調整）
+    anim = FuncAnimation(fig, update, frames=len(snaps), init_func=init, blit=False, interval=200)
+    writer = PillowWriter(fps=5)
+
+    # 保存ディレクトリが無ければ作成（assets は自動生成）
+    path.parent.mkdir(parents=True, exist_ok=True)
+    anim.save(str(path), writer=writer)
+    plt.close(fig)
+    return path
+
+# ------------------ 実行（エントリポイント） ------------------
 if __name__ == "__main__":
-    cfg = GAConfig(
-        dim=2,                   # 2にすると右側の散布が出ます。>=3でも収束曲線はライブ更新されます
-        lower_bound=-5.12,
-        upper_bound=5.12,
-        pop_size=120,
-        max_generations=300,
-        elite_ratio=0.02,
-        tournament_k=3,
-        crossover_rate=0.9,
-        mutation_rate=1.0/10,
-        sbx_eta=20.0,
-        pm_eta=20.0,
-        stagnation_patience=80,
-        random_seed=42,
-        keep_history=True,
-        log_interval=20,
-        realtime=True,          # ← ライブ描画ON
-        refresh_every=5,        # ← 5世代ごとに再描画
-        show_2d_scatter=True,   # ← dim==2のとき散布図表示
-    )
+    # GAの設定を適用
+    cfg = GAConfig()
 
-    best_x, best_f, best_gen, history = run_ga(rastrigin, cfg)
-    print("\n=== RESULT ===")
-    print(f"best fitness  : {best_f:.12f}")
-    print(f"found at gen  : {best_gen}")
-    print(f"best solution : {['{:.12f}'.format(v) for v in best_x]}")
+    # GIF保存先パス
+    gif_path = Path(__file__).parent.parent / "assets" / "GA_result.gif"
+
+    # GA 実行
+    best_x, best_f, best_gen, snaps = run_ga_mgg_with_snapshots(rastrigin, cfg)
+
+    # GIF 生成
+    gif_file = make_animation(snaps, cfg, gif_path)
+
+    # 結果表示
+    print("\n=== 結果 ===")
+    print(f"最良適応度 : {best_f:.6f}")
+    print(f"発見世代   : {best_gen}")
+    print(f"最良解     : {best_x}")
+    print(f"GIF保存先  : {gif_file}")
