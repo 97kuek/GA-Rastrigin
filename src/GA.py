@@ -24,31 +24,29 @@ def rastrigin(x: List[float]) -> float:
 @dataclass
 class GAConfig:
     # 探索空間など
-    dim: int = 2                      # 変数の次元（ここでは2次元）
-    lower_bound: float = -5.12        # 探索範囲の下限
-    upper_bound: float =  5.12        # 探索範囲の上限
+    dim: int = 2                        # 変数の次元（ここでは2次元）
+    lower_bound: float = -5.12          # 探索範囲の下限
+    upper_bound: float =  5.12          # 探索範囲の上限
 
     # 初期集団
     init_low: float = -5.12
     init_high: float = -2.0
 
     # GAの規模
-    pop_size: int = 30                # 集団サイズ
-    max_generations: int = 100        # 最大世代数
-    offspring_per_gen: int = 60       # 1世代で生成する子の数（交叉→突然変異）
+    pop_size: int = 30                  # 集団サイズ
+    max_generations: int = 100          # 最大世代数
+    offspring_per_gen: int = 60         # 1世代で生成する子の数（交叉→突然変異）
 
     # 交叉パラメータ
-    blx_alpha: float = 0.5            # BLX-α の α（親の区間 ±αI まで一様サンプル）
+    blx_alpha: float = 0.5              # BLX-α の α（親の区間 ±αI まで一様サンプル）
 
-    # ★突然変異パラメータ（今回追加）★
-    #   - mutation_prob：各遺伝子（次元）に対し、この確率でノイズを加える
-    #   - mutation_sigma：ノイズの標準偏差（探索範囲幅に対する相対スケールで設定）
-    mutation_prob: float = 0.2
+    # 突然変異パラメータ
+    mutation_prob: float = 0.2          # 突然変異の確率（各遺伝子に対して）
     mutation_sigma_ratio: float = 0.08  # 範囲幅 * 0.08 を標準偏差に
 
     # その他
-    random_seed: Optional[int] = 42   # 再現性のため固定（Noneにすると毎回ランダム）
-    log_interval: int = 10            # ログ表示間隔（世代単位）
+    random_seed: Optional[int] = 42     # 再現性のため固定（Noneにすると毎回ランダム）
+    log_interval: int = 10              # ログ表示間隔（世代単位）
 
 # ------------------ ユーティリティ関数群 ------------------
 def clamp(x: float, lo: float, hi: float) -> float:
@@ -73,15 +71,15 @@ def roulette_select(pop: List[List[float]], fitness: List[float]) -> List[float]
     - 値が小さい個体ほど選ばれやすいように重みを付ける
     - 重み s_i = f_max - f_i として、非負＆小さい f_i ほど大きい s_i になる
     """
-    fmax = max(fitness)
-    scores = [fmax - f for f in fitness]
-    ssum = sum(scores)
+    fmax = max(fitness)                                                                     # 最大適応度（最小化なので最小値を求める）
+    scores = [fmax - f for f in fitness]                                                    # スコアを計算（小さいほど選ばれやすい）
+    ssum = sum(scores)                                                                      # スコアの合計
     if ssum <= 0:
         # もし全員同じスコアなら一様ランダム
         return pop[random.randrange(len(pop))][:]
     r = random.random() * ssum
     acc = 0.0
-    for ind, s in zip(pop, scores):
+    for ind, s in zip(pop, scores): # 個体とスコアを同時にループ
         acc += s
         if acc >= r:
             return ind[:]
@@ -109,20 +107,20 @@ def blx_alpha_crossover(p1: List[float], p2: List[float], cfg: GAConfig) -> List
 
 def gaussian_mutation(ind: List[float], cfg: GAConfig) -> List[float]:
     """
-    ★ガウス変異（今回追加）
-    - 各遺伝子について確率 mutation_prob で N(0, sigma^2) のノイズを加える
+    ガウス変異
+    - 個体の各遺伝子について確率 mutation_prob の確率で突然変異を起こす
+    - 突然変異が起こる場合、N(0, sigma^2) に従う乱数を現在の遺伝子の値に加算する
     - sigma は探索範囲幅に対する比（mutation_sigma_ratio）から算出
     - 範囲外に出たら clamp で修復
     """
-    lb, ub = cfg.lower_bound, cfg.upper_bound
-    width = ub - lb
-    sigma = cfg.mutation_sigma_ratio * width  # 例：幅×0.08
-    new_ind = ind[:]  # 破壊的変更を避けるならコピーして返す
+    lb, ub = cfg.lower_bound, cfg.upper_bound                   # 探索範囲の下限と上限
+    width = ub - lb                                             # 探索範囲の幅
+    sigma = cfg.mutation_sigma_ratio * width                    # 例：幅×0.08
+    new_ind = ind[:]                                            # 元の個体をコピーして変異後の個体を作成
     for i in range(cfg.dim):
-        if random.random() < cfg.mutation_prob:
-            # 平均0, 標準偏差sigmaの正規分布からノイズを足す
-            mutated = new_ind[i] + random.gauss(0.0, sigma)
-            new_ind[i] = clamp(mutated, lb, ub)
+        if random.random() < cfg.mutation_prob:                 # 突然変異の確率が満たされた場合
+            mutated = new_ind[i] + random.gauss(0.0, sigma)     # N(0, sigma^2) の乱数を加える
+            new_ind[i] = clamp(mutated, lb, ub)                 # 範囲外に出たら clamp で修復
     return new_ind
 
 # ------------------ GA本体（MGGモデル） ------------------
@@ -134,7 +132,7 @@ def run_ga_mgg_with_snapshots(objective: Callable[[List[float]], float], cfg: GA
     3. 生存選択：親2 + 子 の中から最良2体を選ぶ
     4. 置換：集団内の2枠だけを置き換える（= ギャップ最小）
     """
-    # 再現性のため乱数シード固定（必要なければ None に）
+
     if cfg.random_seed is not None:
         random.seed(cfg.random_seed)
 
@@ -212,12 +210,12 @@ def make_animation(snaps: List[Dict[str, Any]], cfg: GAConfig, path: Path):
     - 灰：子（交叉→突然変異後）
     """
     lb, ub = cfg.lower_bound, cfg.upper_bound
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.set_xlim(lb, ub)
-    ax.set_ylim(lb, ub)
-    ax.set_xlabel("x0")
-    ax.set_ylabel("x1")
-    ax.set_title("Population Evolution (BLX-α + Gaussian Mutation, MGG)")
+    fig, ax = plt.subplots(figsize=(6, 6))                                                          # グラフのサイズを設定
+    ax.set_xlim(lb, ub)                                                                             # x軸の範囲を設定
+    ax.set_ylim(lb, ub)                                                                             # y軸の範囲を設定
+    ax.set_xlabel("x")                                                                              # x軸ラベル
+    ax.set_ylabel("y")                                                                              # y軸ラベル
+    ax.set_title("Genetic Algorithm (BLX-α + Gaussian Mutation, MGG)")                              # タイトル設定
 
     # 各描画レイヤ
     scat_pop = ax.scatter([], [], s=25, color="blue", label="Population")
